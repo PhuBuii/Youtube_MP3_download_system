@@ -16,5 +16,5 @@ export function safeFilename(value: string, extension: string): string {
     .replace(/\s+/g, " ")
     .trim()
     .slice(0, 90);
-  return `${basename || "sonicfetch-media"}.${extension}`;
+  return `${basename || "pb-media"}.${extension}`;
 }

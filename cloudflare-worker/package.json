@@ -1,10 +1,12 @@
 {
-  "name": "sonicfetch-cors-worker",
+  "name": "pb-media-fetch-cors-worker",
   "private": true,
   "version": "1.0.0",
+  "type": "module",
   "scripts": {
     "dev": "wrangler dev worker.js --local --port 8787",
-    "deploy": "wrangler deploy"
+    "deploy": "wrangler deploy",
+    "test": "node --test tests/*.test.mjs"
   },
   "devDependencies": {
     "wrangler": "^3.99.0"

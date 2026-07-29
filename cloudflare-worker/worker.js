@@ -37,7 +37,7 @@ export default {
 
     const range = request.headers.get("Range");
     const upstreamHeaders = new Headers({
-      "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 SonicFetch",
+      "User-Agent": request.headers.get("User-Agent") || "Mozilla/5.0 PB Media Fetch",
       "Accept": request.headers.get("Accept") || "*/*",
     });
     if (range) upstreamHeaders.set("Range", range);
@@ -61,13 +61,13 @@ export default {
   },
 };
 
-function isAllowedTarget(url) {
+export function isAllowedTarget(url) {
   if (url.protocol !== "https:") return false;
   const host = url.hostname.toLowerCase();
   return Array.from(ALLOWED_HOSTS).some((allowed) => host === allowed || host.endsWith(`.${allowed}`));
 }
 
-function corsHeaders(origin) {
+export function corsHeaders(origin) {
   return {
     "Access-Control-Allow-Origin": origin,
     "Access-Control-Allow-Methods": "GET,HEAD,OPTIONS",

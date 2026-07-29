@@ -10,6 +10,8 @@ class Settings(BaseSettings):
     ytdlp_pot_provider: str = "bgutil"
     ytdlp_bgutil_base_url: str = "http://127.0.0.1:4416"
     ytdlp_socket_timeout: int = 20
+    rate_limit_window_seconds: int = 60
+    rate_limit_max_requests: int = 30
 
     model_config = SettingsConfigDict(env_file=".env", env_file_encoding="utf-8")
 

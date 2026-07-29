@@ -16,6 +16,7 @@ type WorkerRequest =
 
 const ffmpeg = new FFmpeg();
 let loaded = false;
+const STREAM_TIMEOUT_MS = 120000;
 
 self.onmessage = async (event: MessageEvent<WorkerRequest>) => {
   try {
@@ -119,9 +120,11 @@ async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, message: s
 
 async function fetchStream(corsProxyUrl: string, streamUrl: string, onProgress: (progress: number) => void): Promise<ArrayBuffer> {
   const proxied = `${corsProxyUrl.replace(/\/$/, "")}/?url=${encodeURIComponent(streamUrl)}`;
-  const response = await fetch(proxied);
+  const response = await fetch(proxied, {
+    signal: AbortSignal.timeout(STREAM_TIMEOUT_MS),
+  });
   if (!response.ok || !response.body) {
-    throw new Error(`Không tải được stream: ${response.status}`);
+    throw new Error(`Không tải được stream: ${response.status}. Direct URL có thể đã hết hạn, hãy bấm thử lại.`);
   }
 
   const total = Number(response.headers.get("content-length") || 0);

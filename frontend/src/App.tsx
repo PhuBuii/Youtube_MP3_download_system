@@ -4,6 +4,7 @@ import {
   Clock3,
   Cpu,
   FileDown,
+  RefreshCcw,
   Loader2,
   Music2,
   Pause,
@@ -24,8 +25,21 @@ import {
   useState,
 } from "react";
 
-import { extractStream, getMetadata, searchVideos } from "./api";
+import {
+  API_BASE_URL,
+  checkBackendHealth,
+  extractStream,
+  getMetadata,
+  searchVideos,
+} from "./api";
+import {
+  audioFormatChoice,
+  formatBytes,
+  toBackendFormatId,
+  videoFormatChoice,
+} from "./download";
 import type {
+  DiagnosticItem,
   DownloadChoice,
   ExtractStreamResponse,
   Metadata,
@@ -48,6 +62,7 @@ type JobStatus =
   | "processing"
   | "fallback"
   | "done"
+  | "cancelled"
   | "error";
 type WarmStatus = "idle" | "warming" | "ready" | "error";
 
@@ -96,10 +111,11 @@ const videoChoices: DownloadChoice[] = [
 
 const CORS_PROXY_URL =
   import.meta.env.VITE_CORS_PROXY_URL ?? "http://127.0.0.1:8787";
-const JOB_STORAGE_KEY = "sonicfetch-download-jobs";
+const JOB_STORAGE_KEY = "pb-media-fetch-download-jobs";
 const INITIAL_SEARCH_LIMIT = 12;
 const SEARCH_LIMIT_STEP = 12;
 const MAX_SEARCH_LIMIT = 60;
+const STREAM_TIMEOUT_MS = 120000;
 
 export default function App() {
   const [query, setQuery] = useState("");
@@ -123,6 +139,10 @@ export default function App() {
   const [warmDetail, setWarmDetail] = useState(
     "FFmpeg đang chờ khởi tạo tự động.",
   );
+  const [diagnostics, setDiagnostics] = useState<DiagnosticItem[]>(() =>
+    initialDiagnostics(),
+  );
+  const [isCheckingDiagnostics, setIsCheckingDiagnostics] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
   const jobsRef = useRef<CartJob[]>([]);
@@ -130,6 +150,10 @@ export default function App() {
   const queueEnabledRef = useRef(false);
   const preloadWorkerRef = useRef<Worker | null>(null);
   const preloadStartedRef = useRef(false);
+  const activeWorkersRef = useRef(new Map<string, Worker>());
+  const activeAbortRef = useRef(new Map<string, AbortController>());
+  const cancelResolversRef = useRef(new Map<string, () => void>());
+  const cancelledJobsRef = useRef(new Set<string>());
 
   useEffect(() => {
     jobsRef.current = jobs;
@@ -147,6 +171,8 @@ export default function App() {
       jobsRef.current.forEach((job) => {
         if (job.downloadUrl) URL.revokeObjectURL(job.downloadUrl);
       });
+      activeWorkersRef.current.forEach((worker) => worker.terminate());
+      activeAbortRef.current.forEach((controller) => controller.abort());
       preloadWorkerRef.current?.terminate();
     };
   }, []);
@@ -163,6 +189,23 @@ export default function App() {
     if (!metadata) return "";
     return `${metadata.audio_formats.length} audio stream, ${metadata.video_formats.length} video stream khả dụng`;
   }, [metadata]);
+  const availableChoices = useMemo(() => {
+    if (!metadata) return activeTab === "audio" ? audioChoices : videoChoices;
+    const formats =
+      activeTab === "audio" ? metadata.audio_formats : metadata.video_formats;
+    const choices = formats
+      .filter((format) => format.format_id)
+      .map((format) =>
+        activeTab === "audio"
+          ? audioFormatChoice(format)
+          : videoFormatChoice(format),
+      );
+    return choices.length > 0
+      ? choices
+      : activeTab === "audio"
+        ? audioChoices
+        : videoChoices;
+  }, [activeTab, metadata]);
 
   async function handleSearch(event: FormEvent) {
     event.preventDefault();
@@ -217,7 +260,10 @@ export default function App() {
     setActiveTab("audio");
     setSelectedChoice(audioChoices[2]);
     try {
-      setMetadata(await getMetadata(video.url));
+      const nextMetadata = await getMetadata(video.url);
+      setMetadata(nextMetadata);
+      const bestAudio = nextMetadata.audio_formats[0];
+      setSelectedChoice(bestAudio ? audioFormatChoice(bestAudio) : audioChoices[2]);
     } catch (err) {
       setError(
         err instanceof Error
@@ -261,6 +307,50 @@ export default function App() {
     queueEnabledRef.current = false;
   }
 
+  function retryJob(id: string) {
+    cancelledJobsRef.current.delete(id);
+    setJobs((current) =>
+      current.map((job) => {
+        if (job.id !== id) return job;
+        if (job.downloadUrl) URL.revokeObjectURL(job.downloadUrl);
+        return {
+          ...job,
+          status: "queued",
+          stage: "Đang chờ thử lại",
+          detail: "Job sẽ bóc direct stream URL mới trước khi tải lại.",
+          phase: "metadata",
+          progress: 0,
+          startedAt: undefined,
+          updatedAt: undefined,
+          filename: undefined,
+          downloadUrl: undefined,
+          error: undefined,
+        };
+      }),
+    );
+    if (queueEnabledRef.current) window.setTimeout(pumpQueue, 0);
+  }
+
+  function cancelJob(id: string) {
+    cancelledJobsRef.current.add(id);
+    activeAbortRef.current.get(id)?.abort();
+    activeWorkersRef.current.get(id)?.terminate();
+    activeWorkersRef.current.delete(id);
+    cancelResolversRef.current.get(id)?.();
+    cancelResolversRef.current.delete(id);
+    runningRef.current.delete(id);
+    updateJob(id, {
+      status: "cancelled",
+      stage: "Đã hủy",
+      detail: "Job đã dừng. Bấm thử lại để bóc stream mới và chạy lại.",
+      phase: "done",
+      progress: 100,
+      updatedAt: Date.now(),
+      error: undefined,
+    });
+    window.setTimeout(pumpQueue, 0);
+  }
+
   function pumpQueue() {
     if (!queueEnabledRef.current) return;
     const slots = Math.max(0, concurrency - runningRef.current.size);
@@ -281,6 +371,7 @@ export default function App() {
   }
 
   async function runJob(job: CartJob) {
+    if (cancelledJobsRef.current.has(job.id)) return;
     const startedAt = Date.now();
     updateJob(job.id, {
       status: "preparing",
@@ -298,6 +389,7 @@ export default function App() {
         job.video.url,
         toBackendFormatId(job.choice),
       );
+      if (cancelledJobsRef.current.has(job.id)) return;
       updateJob(job.id, {
         status: "processing",
         stage: job.useOriginal ? "Đang tải file gốc" : "Đang chuẩn bị FFmpeg",
@@ -314,6 +406,7 @@ export default function App() {
       }
       await transcodeJob(job, stream);
     } catch (err) {
+      if (cancelledJobsRef.current.has(job.id)) return;
       const message =
         err instanceof Error ? err.message : "Tải xuống thất bại.";
       updateJob(job.id, {
@@ -325,6 +418,10 @@ export default function App() {
         error: message,
         updatedAt: Date.now(),
       });
+    } finally {
+      activeWorkersRef.current.delete(job.id);
+      activeAbortRef.current.delete(job.id);
+      cancelResolversRef.current.delete(job.id);
     }
   }
 
@@ -334,8 +431,15 @@ export default function App() {
         new URL("./workers/transcode.worker.ts", import.meta.url),
         { type: "module" },
       );
+      activeWorkersRef.current.set(job.id, worker);
+      cancelResolversRef.current.set(job.id, resolve);
 
       worker.onmessage = (event: MessageEvent<WorkerMessage>) => {
+        if (cancelledJobsRef.current.has(job.id)) {
+          worker.terminate();
+          resolve();
+          return;
+        }
         const message = event.data;
         if (message.type === "PROGRESS") {
           updateJob(job.id, {
@@ -352,6 +456,8 @@ export default function App() {
 
         if (message.type === "ERROR") {
           worker.terminate();
+          activeWorkersRef.current.delete(job.id);
+          cancelResolversRef.current.delete(job.id);
           void fallbackOriginal(job, stream, message.error).finally(resolve);
           return;
         }
@@ -376,6 +482,8 @@ export default function App() {
             updatedAt: Date.now(),
           });
           worker.terminate();
+          activeWorkersRef.current.delete(job.id);
+          cancelResolversRef.current.delete(job.id);
           resolve();
         }
       };
@@ -394,6 +502,8 @@ export default function App() {
     stream: ExtractStreamResponse,
   ) {
     const firstStream = stream.streams[0];
+    const controller = new AbortController();
+    activeAbortRef.current.set(job.id, controller);
     try {
       updateJob(job.id, {
         status: "processing",
@@ -403,16 +513,22 @@ export default function App() {
         progress: 6,
         updatedAt: Date.now(),
       });
-      const blob = await fetchStreamBlob(firstStream.url, (progress) => {
-        updateJob(job.id, {
-          status: "processing",
-          stage: "Đang tải file gốc",
-          detail: "Đang tải qua CORS proxy.",
-          phase: "download",
-          progress: Math.min(98, progress),
-          updatedAt: Date.now(),
-        });
-      });
+      const blob = await fetchStreamBlob(
+        firstStream.url,
+        (progress) => {
+          if (cancelledJobsRef.current.has(job.id)) return;
+          updateJob(job.id, {
+            status: "processing",
+            stage: "Đang tải file gốc",
+            detail: "Đang tải qua CORS proxy.",
+            phase: "download",
+            progress: Math.min(98, progress),
+            updatedAt: Date.now(),
+          });
+        },
+        controller.signal,
+      );
+      if (cancelledJobsRef.current.has(job.id)) return;
       const extension =
         firstStream.ext ?? (job.choice.mediaType === "audio" ? "m4a" : "mp4");
       const filename = safeFilename(
@@ -433,6 +549,7 @@ export default function App() {
         updatedAt: Date.now(),
       });
     } catch (err) {
+      if (cancelledJobsRef.current.has(job.id)) return;
       const message =
         err instanceof Error ? err.message : "Tải file gốc thất bại.";
       updateJob(job.id, {
@@ -444,6 +561,8 @@ export default function App() {
         error: message,
         updatedAt: Date.now(),
       });
+    } finally {
+      activeAbortRef.current.delete(job.id);
     }
   }
 
@@ -544,15 +663,59 @@ export default function App() {
     setJobs((current) => {
       current.forEach((job) => {
         if (
-          (job.status === "done" || job.status === "error") &&
+          (job.status === "done" ||
+            job.status === "error" ||
+            job.status === "cancelled") &&
           job.downloadUrl
         )
           URL.revokeObjectURL(job.downloadUrl);
       });
       return current.filter(
-        (job) => job.status !== "done" && job.status !== "error",
+        (job) =>
+          job.status !== "done" &&
+          job.status !== "error" &&
+          job.status !== "cancelled",
       );
     });
+  }
+
+  async function runDiagnostics() {
+    setIsCheckingDiagnostics(true);
+    const next = initialDiagnostics().map((item) => ({
+      ...item,
+      status: "checking" as const,
+      detail: "Đang kiểm tra...",
+    }));
+    setDiagnostics(next);
+
+    const results: DiagnosticItem[] = [
+      {
+        id: "api-url",
+        label: "API base URL",
+        status: API_BASE_URL ? "ok" : "error",
+        detail: API_BASE_URL || "Chưa cấu hình VITE_API_BASE_URL.",
+      },
+      {
+        id: "worker-url",
+        label: "CORS Worker URL",
+        status: CORS_PROXY_URL ? "ok" : "error",
+        detail: CORS_PROXY_URL || "Chưa cấu hình VITE_CORS_PROXY_URL.",
+      },
+      {
+        id: "isolation",
+        label: "Cross-origin isolation",
+        status: window.crossOriginIsolated ? "ok" : "error",
+        detail: window.crossOriginIsolated
+          ? "COOP/COEP đang hoạt động."
+          : "Thiếu COOP/COEP. FFmpeg.wasm có thể lỗi ở runtime.",
+      },
+      await checkHealthDiagnostic(),
+      await checkAssetDiagnostic("/ffmpeg/ffmpeg-core.wasm", "FFmpeg wasm"),
+      await checkWorkerDiagnostic(),
+    ];
+
+    setDiagnostics(results);
+    setIsCheckingDiagnostics(false);
   }
 
   return (
@@ -560,12 +723,23 @@ export default function App() {
       <header className="border-b border-[#e5e7eb] bg-white">
         <div className="mx-auto flex max-w-7xl items-center justify-between px-4 py-4 sm:px-6 lg:px-8">
           <div>
-            <p className="text-xs font-bold uppercase tracking-[0.18em] text-[#0f766e]">
-              SonicFetch
-            </p>
-            <h1 className="text-xl font-black tracking-normal sm:text-2xl">
-              MP3/MP4 Downloader
-            </h1>
+            <div className="flex items-center gap-3">
+              <div className="h-12 w-12 overflow-hidden rounded border border-[#dbe5ef] bg-white shadow-sm">
+                <img
+                  src="/pb-logo.png"
+                  alt="PB Media Fetch"
+                  className="h-full w-full object-cover"
+                />
+              </div>
+              <div>
+                <p className="text-xs font-bold uppercase tracking-[0.18em] text-[#0f766e]">
+                  PB Media Fetch
+                </p>
+                <h1 className="text-xl font-black tracking-normal sm:text-2xl">
+                  MP3/MP4 Downloader
+                </h1>
+              </div>
+            </div>
           </div>
           <div className="hidden items-center gap-2 rounded border border-[#e5e7eb] bg-[#f9fafb] px-3 py-2 text-sm font-bold text-[#4b5563] sm:flex">
             <Cpu className="h-4 w-4 text-[#0f766e]" />
@@ -600,6 +774,23 @@ export default function App() {
               />
             </div>
           </section>
+          <StatusCard
+            icon={<Cpu className="h-5 w-5" />}
+            title={warmLabel(warmStatus)}
+            detail={warmDetail}
+            accent={
+              warmStatus === "ready"
+                ? "text-[#0f766e]"
+                : warmStatus === "error"
+                  ? "text-[#b91c1c]"
+                  : "text-[#2563eb]"
+            }
+          />
+          <DiagnosticsPanel
+            items={diagnostics}
+            isChecking={isCheckingDiagnostics}
+            onRun={() => void runDiagnostics()}
+          />
         </aside>
 
         <div className="min-w-0 space-y-5">
@@ -802,6 +993,8 @@ export default function App() {
                   key={job.id}
                   job={job}
                   onRemove={() => removeJob(job.id)}
+                  onRetry={() => retryJob(job.id)}
+                  onCancel={() => cancelJob(job.id)}
                 />
               ))
             )}
@@ -833,7 +1026,10 @@ export default function App() {
                 <button
                   onClick={() => {
                     setActiveTab("audio");
-                    setSelectedChoice(audioChoices[2]);
+                    const bestAudio = metadata?.audio_formats[0];
+                    setSelectedChoice(
+                      bestAudio ? audioFormatChoice(bestAudio) : audioChoices[2],
+                    );
                   }}
                   className={`inline-flex items-center justify-center gap-2 rounded px-4 py-3 font-black ${activeTab === "audio" ? "bg-white text-[#0f766e] shadow-sm" : "text-[#6b7280]"}`}
                 >
@@ -843,7 +1039,10 @@ export default function App() {
                 <button
                   onClick={() => {
                     setActiveTab("video");
-                    setSelectedChoice(videoChoices[1]);
+                    const bestVideo = metadata?.video_formats[0];
+                    setSelectedChoice(
+                      bestVideo ? videoFormatChoice(bestVideo) : videoChoices[1],
+                    );
                   }}
                   className={`inline-flex items-center justify-center gap-2 rounded px-4 py-3 font-black ${activeTab === "video" ? "bg-white text-[#2563eb] shadow-sm" : "text-[#6b7280]"}`}
                 >
@@ -852,24 +1051,31 @@ export default function App() {
                 </button>
               </div>
 
-              <div className="mt-4 grid grid-cols-2 gap-3 sm:grid-cols-4">
-                {(activeTab === "audio" ? audioChoices : videoChoices).map(
+              <div className="mt-4 grid grid-cols-1 gap-3 sm:grid-cols-2">
+                {availableChoices.map(
                   (choice) => {
                     const label =
-                      choice.mediaType === "audio"
+                      choice.label ??
+                      (choice.mediaType === "audio"
                         ? choice.bitrate
-                        : choice.resolution;
+                        : choice.resolution);
                     const selected =
                       choice.mediaType === selectedChoice.mediaType &&
+                      choice.formatId === selectedChoice.formatId &&
                       choice.bitrate === selectedChoice.bitrate &&
                       choice.resolution === selectedChoice.resolution;
                     return (
                       <button
-                        key={`${choice.mediaType}-${label}`}
+                        key={`${choice.mediaType}-${choice.formatId ?? label}`}
                         onClick={() => setSelectedChoice(choice)}
-                        className={`rounded border px-3 py-3 text-center font-black ${selected ? "border-[#2563eb] bg-[#eff6ff] text-[#1d4ed8]" : "border-[#d1d5db] bg-white text-[#374151] hover:bg-[#f9fafb]"}`}
+                        className={`rounded border px-3 py-3 text-left font-black ${selected ? "border-[#2563eb] bg-[#eff6ff] text-[#1d4ed8]" : "border-[#d1d5db] bg-white text-[#374151] hover:bg-[#f9fafb]"}`}
                       >
-                        {label}
+                        <span className="block">{label}</span>
+                        <span className="mt-1 block text-xs font-bold text-[#64748b]">
+                          {choice.formatId
+                            ? `${formatBytes(choice.filesize)} · ${choice.hasAudio ? "có audio" : "không audio"} · ${choice.hasVideo ? "có video" : "không video"}`
+                            : "Preset tự động"}
+                        </span>
                       </button>
                     );
                   },
@@ -981,10 +1187,84 @@ function StatusCard({
   );
 }
 
-function JobRow({ job, onRemove }: { job: CartJob; onRemove: () => void }) {
+function DiagnosticsPanel({
+  items,
+  isChecking,
+  onRun,
+}: {
+  items: DiagnosticItem[];
+  isChecking: boolean;
+  onRun: () => void;
+}) {
+  return (
+    <section className="rounded border border-[#dbe5ef] bg-white p-4 shadow-sm">
+      <div className="mb-4 flex items-center justify-between gap-3">
+        <div>
+          <h2 className="text-base font-black text-[#172033]">Diagnostics</h2>
+          <p className="mt-1 text-sm font-semibold text-[#64748b]">
+            Kiểm tra runtime trước khi tải.
+          </p>
+        </div>
+        <button
+          onClick={onRun}
+          disabled={isChecking}
+          className="inline-flex h-9 w-9 items-center justify-center rounded border border-[#dbe5ef] text-[#2563eb] hover:bg-[#eff6ff] disabled:cursor-wait disabled:opacity-60"
+          aria-label="Chạy diagnostics"
+          title="Chạy diagnostics"
+        >
+          <RefreshCcw
+            className={`h-4 w-4 ${isChecking ? "animate-spin" : ""}`}
+          />
+        </button>
+      </div>
+      <div className="grid gap-2">
+        {items.map((item) => (
+          <div
+            key={item.id}
+            className="rounded border border-[#e5e7eb] bg-[#f8fafc] px-3 py-2"
+          >
+            <div className="flex items-center justify-between gap-2">
+              <span className="text-sm font-black text-[#172033]">
+                {item.label}
+              </span>
+              <span
+                className={`rounded px-2 py-0.5 text-[11px] font-black uppercase ${diagnosticClass(item.status)}`}
+              >
+                {diagnosticLabel(item.status)}
+              </span>
+            </div>
+            <p className="mt-1 line-clamp-2 text-xs font-semibold leading-5 text-[#64748b]">
+              {item.detail}
+            </p>
+          </div>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function JobRow({
+  job,
+  onRemove,
+  onRetry,
+  onCancel,
+}: {
+  job: CartJob;
+  onRemove: () => void;
+  onRetry: () => void;
+  onCancel: () => void;
+}) {
   const timing = getProgressTiming(job);
   const canRemove =
-    job.status === "queued" || job.status === "done" || job.status === "error";
+    job.status === "done" ||
+    job.status === "error" ||
+    job.status === "cancelled";
+  const canCancel =
+    job.status === "queued" ||
+    job.status === "preparing" ||
+    job.status === "processing" ||
+    job.status === "fallback";
+  const canRetry = job.status === "error" || job.status === "cancelled";
   const FormatIcon = job.choice.mediaType === "audio" ? Music2 : Video;
 
   return (
@@ -1038,6 +1318,24 @@ function JobRow({ job, onRemove }: { job: CartJob; onRemove: () => void }) {
               Tải file
             </a>
           ) : null}
+          {canRetry ? (
+            <button
+              onClick={onRetry}
+              className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded border border-[#bfdbfe] bg-[#eff6ff] text-sm font-black text-[#1d4ed8] hover:bg-[#dbeafe]"
+            >
+              <RefreshCcw className="h-4 w-4" />
+              Thử lại
+            </button>
+          ) : null}
+          {canCancel ? (
+            <button
+              onClick={onCancel}
+              className="inline-flex h-9 flex-1 items-center justify-center gap-2 rounded border border-[#fed7aa] bg-[#fff7ed] text-sm font-black text-[#c2410c] hover:bg-[#ffedd5]"
+            >
+              <X className="h-4 w-4" />
+              Hủy
+            </button>
+          ) : null}
           <button
             onClick={onRemove}
             disabled={!canRemove}
@@ -1060,17 +1358,24 @@ function JobRow({ job, onRemove }: { job: CartJob; onRemove: () => void }) {
 async function fetchStreamBlob(
   streamUrl: string,
   onProgress: (progress: number) => void,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   const proxied = `${CORS_PROXY_URL.replace(/\/$/, "")}/?url=${encodeURIComponent(streamUrl)}`;
-  const response = await fetch(proxied);
+  const timeout = AbortSignal.timeout(STREAM_TIMEOUT_MS);
+  const response = await fetch(proxied, {
+    signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+  });
   if (!response.ok)
-    throw new Error(`Không tải được stream: ${response.status}`);
-  return readResponseBlobWithProgress(response, onProgress);
+    throw new Error(
+      `Không tải được stream: ${response.status}. Direct URL có thể đã hết hạn, hãy bấm thử lại.`,
+    );
+  return readResponseBlobWithProgress(response, onProgress, signal);
 }
 
 async function readResponseBlobWithProgress(
   response: Response,
   onProgress: (progress: number) => void,
+  signal?: AbortSignal,
 ): Promise<Blob> {
   if (!response.body) return response.blob();
 
@@ -1080,6 +1385,7 @@ async function readResponseBlobWithProgress(
   let received = 0;
 
   while (true) {
+    if (signal?.aborted) throw new DOMException("Đã hủy tải xuống", "AbortError");
     const { done, value } = await reader.read();
     if (done) break;
     if (!value) continue;
@@ -1162,6 +1468,7 @@ function statusLabel(status: JobStatus) {
     processing: "Đang chạy",
     fallback: "Fallback",
     done: "Xong",
+    cancelled: "Đã hủy",
     error: "Lỗi",
   };
   return labels[status];
@@ -1174,6 +1481,7 @@ function statusClass(status: JobStatus) {
     processing: "bg-[#dbeafe] text-[#1d4ed8]",
     fallback: "bg-[#ffedd5] text-[#c2410c]",
     done: "bg-[#ccfbf1] text-[#0f766e]",
+    cancelled: "bg-[#f3f4f6] text-[#64748b]",
     error: "bg-[#ffe4e6] text-[#be123c]",
   };
   return classes[status];
@@ -1189,7 +1497,151 @@ function warmLabel(status: WarmStatus) {
   return labels[status];
 }
 
+function diagnosticLabel(status: DiagnosticItem["status"]) {
+  const labels: Record<DiagnosticItem["status"], string> = {
+    checking: "Đang kiểm",
+    ok: "OK",
+    warning: "Cảnh báo",
+    error: "Lỗi",
+  };
+  return labels[status];
+}
+
+function diagnosticClass(status: DiagnosticItem["status"]) {
+  const classes: Record<DiagnosticItem["status"], string> = {
+    checking: "bg-[#dbeafe] text-[#1d4ed8]",
+    ok: "bg-[#ccfbf1] text-[#0f766e]",
+    warning: "bg-[#fef3c7] text-[#92400e]",
+    error: "bg-[#ffe4e6] text-[#be123c]",
+  };
+  return classes[status];
+}
+
+function initialDiagnostics(): DiagnosticItem[] {
+  return [
+    {
+      id: "api-url",
+      label: "API base URL",
+      status: "warning",
+      detail: API_BASE_URL,
+    },
+    {
+      id: "worker-url",
+      label: "CORS Worker URL",
+      status: "warning",
+      detail: CORS_PROXY_URL,
+    },
+    {
+      id: "isolation",
+      label: "Cross-origin isolation",
+      status: "warning",
+      detail: "Chưa kiểm tra.",
+    },
+    {
+      id: "backend",
+      label: "Backend /health",
+      status: "warning",
+      detail: "Chưa kiểm tra.",
+    },
+    {
+      id: "ffmpeg-wasm",
+      label: "FFmpeg wasm",
+      status: "warning",
+      detail: "Chưa kiểm tra.",
+    },
+    {
+      id: "worker-cors",
+      label: "Worker CORS",
+      status: "warning",
+      detail: "Chưa kiểm tra.",
+    },
+  ];
+}
+
+async function checkHealthDiagnostic(): Promise<DiagnosticItem> {
+  try {
+    const health = await checkBackendHealth();
+    return {
+      id: "backend",
+      label: "Backend /health",
+      status: health.status === "ok" ? "ok" : "warning",
+      detail: `Backend trả về status=${health.status}.`,
+    };
+  } catch (error) {
+    return {
+      id: "backend",
+      label: "Backend /health",
+      status: "error",
+      detail:
+        error instanceof Error
+          ? error.message
+          : "Không gọi được backend /health.",
+    };
+  }
+}
+
+async function checkAssetDiagnostic(
+  path: string,
+  label: string,
+): Promise<DiagnosticItem> {
+  try {
+    const response = await fetch(path, { method: "HEAD" });
+    const contentType = response.headers.get("content-type") ?? "";
+    return {
+      id: "ffmpeg-wasm",
+      label,
+      status:
+        response.ok && contentType.includes("application/wasm")
+          ? "ok"
+          : "warning",
+      detail: `${response.status} ${contentType || "không có content-type"}`,
+    };
+  } catch (error) {
+    return {
+      id: "ffmpeg-wasm",
+      label,
+      status: "error",
+      detail:
+        error instanceof Error
+          ? error.message
+          : "Không kiểm tra được asset FFmpeg.",
+    };
+  }
+}
+
+async function checkWorkerDiagnostic(): Promise<DiagnosticItem> {
+  if (!CORS_PROXY_URL) {
+    return {
+      id: "worker-cors",
+      label: "Worker CORS",
+      status: "error",
+      detail: "Chưa cấu hình Worker URL.",
+    };
+  }
+  try {
+    const url = `${CORS_PROXY_URL.replace(/\/$/, "")}/?url=${encodeURIComponent("https://www.youtube.com/")}`;
+    const response = await fetch(url, { method: "HEAD" });
+    return {
+      id: "worker-cors",
+      label: "Worker CORS",
+      status: response.ok || response.status < 500 ? "ok" : "warning",
+      detail: `Worker trả về HTTP ${response.status}.`,
+    };
+  } catch (error) {
+    return {
+      id: "worker-cors",
+      label: "Worker CORS",
+      status: "warning",
+      detail:
+        error instanceof Error
+          ? error.message
+          : "Không gọi được Worker. Hãy kiểm tra VITE_CORS_PROXY_URL.",
+    };
+  }
+}
+
 function choiceLabel(choice: DownloadChoice) {
+  if (choice.label) return choice.label;
   return choice.mediaType === "audio"
     ? `MP3 ${choice.bitrate ?? "128k"}`
     : `MP4 ${choice.resolution ?? "720p"}`;
@@ -1224,12 +1676,6 @@ function detectRecommendedWorkers() {
   if (cores >= 12 && memory >= 12) return 3;
   if (cores >= 8 && memory >= 8) return 2;
   return 1;
-}
-
-function toBackendFormatId(choice: DownloadChoice): string {
-  if (choice.mediaType === "audio")
-    return `mp3_${choice.bitrate?.replace("k", "") ?? "128"}`;
-  return `mp4_${choice.resolution ?? "720p"}`;
 }
 
 function looksLikeUrl(value: string) {

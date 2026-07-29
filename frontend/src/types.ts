@@ -50,4 +50,19 @@ export type DownloadChoice = {
   mediaType: "audio" | "video";
   bitrate?: "320k" | "256k" | "128k" | "64k";
   resolution?: "1080p" | "720p" | "480p" | "360p";
+  formatId?: string;
+  label?: string;
+  ext?: string | null;
+  filesize?: number | null;
+  hasAudio?: boolean;
+  hasVideo?: boolean;
+};
+
+export type DiagnosticStatus = "checking" | "ok" | "warning" | "error";
+
+export type DiagnosticItem = {
+  id: string;
+  label: string;
+  detail: string;
+  status: DiagnosticStatus;
 };

@@ -14,6 +14,12 @@ class SearchResponse(BaseModel):
     results: list[SearchItem]
 
 
+class ErrorDetail(BaseModel):
+    code: str
+    message: str
+    hint: str | None = None
+
+
 class FormatItem(BaseModel):
     format_id: str
     label: str
